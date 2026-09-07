@@ -49,6 +49,20 @@ export class Lobby extends Server {
     await this.ctx.storage.put("rooms", [...this.rooms]);
   }
 
+  // Durable Object RPC (room objects call `stub.getBackupKey()`; NOT reachable
+  // over HTTP — onRequest never exposes it). One random 256-bit AES key, minted
+  // on first use and kept here forever, seals every room's host backup so the
+  // blob a host's browser holds can't be read or forged, only handed back.
+  async getBackupKey() {
+    let key = await this.ctx.storage.get("backupKey");
+    if (!key) {
+      const raw = crypto.getRandomValues(new Uint8Array(32));
+      key = btoa(String.fromCharCode(...raw));
+      await this.ctx.storage.put("backupKey", key);
+    }
+    return key;
+  }
+
   // Drop stale entries: long-dead rooms and abandoned reservations.
   sweep() {
     const now = Date.now();
@@ -81,6 +95,7 @@ export class Lobby extends Server {
         this.rooms.delete(code);
       } else {
         this.rooms.set(code, {
+          gameType: typeof body.gameType === "string" ? body.gameType : "blackqueen",
           started: !!body.started,
           joinable: !!body.joinable,
           live: !!body.live,
@@ -121,10 +136,15 @@ export class Lobby extends Server {
       if (!this.env.DB) return json({ error: "none" }, 404);
       const user = await getUser(req, this.env).catch(() => null);
       if (!user) return json({ error: "unauthorized" }, 401);
-      const hit = [...this.rooms].find(([, v]) =>
-        !v.reserved && Array.isArray(v.users) && v.users.includes(user.id));
-      return hit
-        ? json({ code: hit[0], started: !!hit[1].started, live: !!hit[1].live })
+      // Every room holding a seat for this account (started games first, newest
+      // first) — the menu lists them all under "Unfinished games"; `code` keeps
+      // the original single-answer shape for older clients.
+      const rooms = [...this.rooms]
+        .filter(([, v]) => !v.reserved && Array.isArray(v.users) && v.users.includes(user.id))
+        .sort(([, a], [, b]) => (Number(!!b.started) - Number(!!a.started)) || ((b.ts || 0) - (a.ts || 0)))
+        .map(([code, v]) => ({ code, gameType: v.gameType || "blackqueen", started: !!v.started, live: !!v.live, ts: v.ts || 0 }));
+      return rooms.length
+        ? json({ code: rooms[0].code, started: rooms[0].started, live: rooms[0].live, rooms })
         : json({ error: "none" }, 404);
     }
 

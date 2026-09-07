@@ -53,6 +53,44 @@
     try { localStorage.removeItem('bq_session'); } catch (_) {}
   }
 
+  // ---- host backups of multiplayer rooms -----------------------------------
+  // While we are host, the room streams us a sealed (AES-GCM, server-keyed)
+  // copy of its full state after every change. We can't read it — it's only
+  // useful handed back: if the room ever vanishes from the server, `restore`
+  // rebuilds it from this blob and everyone rejoins. code -> {blob, meta, ts}.
+  const BACKUPS_KEY = 'bq_backups';
+  const BACKUP_MAX = 6;
+  const BACKUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  function loadBackups() {
+    let all;
+    try { all = JSON.parse(localStorage.getItem(BACKUPS_KEY) || '{}'); } catch (_) { all = {}; }
+    if (!all || typeof all !== 'object') all = {};
+    // Expire stale entries; keep only the newest few.
+    const now = Date.now();
+    const keep = Object.keys(all)
+      .filter((c) => all[c] && typeof all[c].blob === 'string' && (now - (all[c].ts || 0)) < BACKUP_TTL_MS)
+      .sort((a, b) => (all[b].ts || 0) - (all[a].ts || 0))
+      .slice(0, BACKUP_MAX);
+    const out = {};
+    keep.forEach((c) => { out[c] = all[c]; });
+    return out;
+  }
+  function saveBackups(all) {
+    try { localStorage.setItem(BACKUPS_KEY, JSON.stringify(all)); } catch (_) {}
+  }
+  function putBackup(code, blob, meta) {
+    const all = loadBackups();
+    all[code] = { blob, meta: meta || {}, ts: Date.now() };
+    saveBackups(all);
+  }
+  function dropBackup(code) {
+    if (!code) return;
+    const all = loadBackups();
+    if (!(code in all)) return;
+    delete all[code];
+    saveBackups(all);
+  }
+
   // ---- single-player game persistence (survives refresh; works offline) --
   const SP_KEY = 'bq_sp_game';
   function loadSPGame() {
@@ -498,7 +536,17 @@
     if (net && net.connected && net.roomId === code) return Promise.resolve();
     net = new BQ.NetClient();
     wireNet();
+    // The table's engine mirror sends moves through the client it was built
+    // with — point it at the NEW socket, or every play after a reconnect would
+    // go quietly into the dead one.
+    if (netEngine) netEngine.client = net;
     return net.connect(code, 'main');
+  }
+
+  // Session token for a room, if this device holds one (else undefined: the
+  // server matches the seat by account instead — cross-device rejoin).
+  function tokenFor(code) {
+    return (session && session.code === code && session.token) ? session.token : undefined;
   }
 
   // Re-open the socket and reclaim our seat, backing off on repeated failure.
@@ -514,44 +562,111 @@
     }, delay);
   }
 
-  /* ---- Cross-device rejoin -------------------------------------------------
-   * The lobby knows which room holds a seat for the logged-in account
-   * (GET ?need=mine, resolved from the session cookie). If it's a DIFFERENT
-   * device than the one that joined (no local token for that room), offer a
-   * one-tap "Rejoin your game" on the menu. The server hands the seat over on
-   * a token-less resume matched by userId — see party/main.js 'resume'.       */
-  let rejoinCode = null;
+  /* ---- Unfinished games (menu panel) ---------------------------------------
+   * Two sources, merged by room code:
+   *   • the lobby's answer to "which rooms hold a seat for MY account?"
+   *     (GET ?need=mine — a game started on another device, or one the server
+   *     is holding because everyone dropped);
+   *   • this device's host backups (see putBackup) — a room the server LOST
+   *     can be rebuilt from these, so they're listed even when the lobby has
+   *     never heard of the room.
+   * One tap rejoins: connect, `resume` (token if we have one, else by account);
+   * if the room answers "room-gone" and we hold a backup, `restore` it first.  */
+  const GAME_LABEL = { blackqueen: ['♛', 'Black Queen'], treeky: ['🎴', 'Treeky'], bluff: ['🃏', 'Bluff'] };
+  let serverRooms = [];            // last ?need=mine answer
+  let restoreTried = new Set();    // rooms we already offered a backup to (no loops)
 
-  function checkActiveGame() {
-    const row = $('#rejoinRow');
-    if (!row) return;
+  const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function ago(ts) {
+    const s = Math.max(0, (Date.now() - ts) / 1000);
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.floor(s / 60) + ' min ago';
+    if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+    return Math.floor(s / 86400) + ' d ago';
+  }
+
+  function renderUnfinished() {
+    const box = $('#unfinishedBox'), list = $('#unfinishedList');
+    if (!box || !list) return;
+    const backups = loadBackups();
+    const rows = new Map();
+    serverRooms.forEach((r) => rows.set(r.code, { code: r.code, gameType: r.gameType, server: true, live: !!r.live, ts: r.ts || 0 }));
+    Object.keys(backups).forEach((code) => {
+      const b = backups[code];
+      const row = rows.get(code) || { code, server: false, live: false, ts: 0 };
+      row.gameType = row.gameType || (b.meta && b.meta.gameType);
+      row.backup = b;
+      row.ts = Math.max(row.ts, b.ts || 0);
+      rows.set(code, row);
+    });
+    // The room we're currently seated in (this tab) isn't "unfinished".
+    if (isMultiplayer && session) rows.delete(session.code);
+    const items = [...rows.values()].sort((a, b) => b.ts - a.ts);
+    if (!items.length) { box.style.display = 'none'; list.innerHTML = ''; return; }
+
+    list.innerHTML = items.map((r) => {
+      const m = (r.backup && r.backup.meta) || {};
+      const sub = [];
+      if (m.round) sub.push('Round ' + m.round);
+      if (Array.isArray(m.players) && m.players.length) sub.push(m.players.map(escHtml).join(', '));
+      if (r.ts) sub.push(ago(r.ts));
+      const chips = (r.server ? '<span class="unfinished-chip live">' + (r.live ? 'on server' : 'held for you') + '</span>' : '') +
+        (r.backup ? '<span class="unfinished-chip local">backup on this device</span>' : '');
+      const forget = r.backup ? '<button class="unfinished-forget" data-forget="' + escHtml(r.code) + '" title="Forget this backup">✕</button>' : '';
+      const label = GAME_LABEL[r.gameType] || GAME_LABEL.blackqueen;
+      return '<div class="unfinished-row">' +
+        '<span class="unfinished-icon">' + label[0] + '</span>' +
+        '<div class="unfinished-main">' +
+          '<div class="unfinished-title">' + escHtml(label[1]) +
+            ' <span class="unfinished-code">#' + escHtml(r.code) + '</span>' + chips + '</div>' +
+          '<div class="unfinished-sub">' + sub.join(' · ') + '</div>' +
+        '</div>' +
+        '<button class="btn primary" data-rejoin="' + escHtml(r.code) + '">' + (r.server ? 'Rejoin' : 'Restore') + '</button>' +
+        forget +
+        '</div>';
+    }).join('');
+    box.style.display = '';
+  }
+
+  // Ask the lobby which rooms hold our seat, then repaint the panel. Always
+  // repaints (from local backups) even when the lobby is unreachable.
+  function refreshUnfinished() {
+    renderUnfinished();
     if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
     fetch('/parties/lobby/lobby?need=mine')
       .then((r) => (r.ok ? r.json() : null))
       .then((m) => {
-        // Same-device sessions resume automatically via the stored token —
-        // only offer the button when this device has no claim on that room.
-        if (m && m.code && !(session && session.code === m.code)) {
-          rejoinCode = m.code;
-          $('#btnRejoin').textContent = '⟳ Rejoin your game (' + m.code + ')';
-          row.style.display = '';
-        } else {
-          rejoinCode = null;
-          row.style.display = 'none';
-        }
+        serverRooms = (m && Array.isArray(m.rooms)) ? m.rooms
+          : (m && m.code) ? [{ code: m.code, started: !!m.started, live: !!m.live, gameType: 'blackqueen', ts: 0 }]
+          : [];
+        renderUnfinished();
       })
       .catch(() => {});
   }
 
-  function rejoinActiveGame() {
-    if (!rejoinCode) return;
-    const code = rejoinCode;
-    rejoinCode = null;
-    $('#rejoinRow').style.display = 'none';
+  // Walk back into a room from the panel (or auto, on page load).
+  function rejoinRoom(code) {
+    if (!code) return;
+    restoreTried.delete(code);
     ui.setReconnecting(true);
     connectTo(code)
-      .then(() => net.send({ t: 'resume' }))   // token-less: server matches by account
+      .then(() => net.send({ t: 'resume', token: tokenFor(code) }))
       .catch(() => { ui.setReconnecting(false); ui.toast('Could not reach the game server.'); });
+  }
+
+  // The room is empty on the server — if this device hosted it, hand back our
+  // sealed copy. Returns true when a restore was sent (the caller waits for
+  // `restored` / `restoreFail` instead of giving up).
+  function tryRestore(code) {
+    if (!code || restoreTried.has(code)) return false;
+    const b = loadBackups()[code];
+    if (!b) return false;
+    restoreTried.add(code);
+    ui.setReconnecting(true);
+    ui.toast('Room ' + code + ' was lost — restoring it from your backup…');
+    net.send({ t: 'restore', code, blob: b.blob, token: tokenFor(code) });
+    return true;
   }
 
   // On page load: walk straight back into whatever game we were in.
@@ -584,8 +699,7 @@
       reconnectAttempts = 0;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       ui.setReconnecting(false);
-      rejoinCode = null;
-      const rj = $('#rejoinRow'); if (rj) rj.style.display = 'none';
+      renderUnfinished();
       ui.setNetStatus('online', net.latencyMs);
       // tell the table about preferences they can see (🛡️ = taunts muted)
       net.send({ t: 'prefs', attacksMuted: BQ.Prefs.get().attacks === false });
@@ -598,17 +712,51 @@
       setMpStatus('👁 Watching room ' + m.code + ' — no cards are shown.', 'ok');
     });
     net.on('error', (m) => { setMpStatus(m.msg || 'Error', 'bad'); $('#mpError').textContent = ''; BQ.Sound.error(); });
-    net.on('resumeFail', () => {
-      // The room/seat is gone (game ended, or held too long). Drop the stale
-      // session and return to a clean menu.
-      clearSession();
+    net.on('resumeFail', (m) => {
+      // The room is empty on the server. If we hosted it and hold a sealed
+      // backup, rebuild it instead of giving up (see tryRestore → 'restored').
+      if (m && m.reason === 'room-gone' && tryRestore(net.roomId)) return;
+      // Otherwise the room/seat really is gone (game ended, held too long, or
+      // the seat was handed to another device). Drop the stale session and
+      // return to a clean menu.
+      const code = net.roomId;
+      if (session && session.code === code) clearSession();
       ui.setReconnecting(false);
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       if (isMultiplayer) { ui.toast('That game has ended — returning to menu.'); isMultiplayer = false; netEngine = null; }
       ui.show('menu');
       // A stale local token (seat handed to another device, then handed back)
-      // can still rejoin by account — offer the button if a seat exists.
-      checkActiveGame();
+      // can still rejoin by account — list it if a seat exists somewhere.
+      refreshUnfinished();
+    });
+    // Our backup was accepted: the room is back with every seat held — take ours.
+    net.on('restored', (m) => {
+      ui.toast('Room ' + (m.code || net.roomId) + ' restored — rejoining…');
+      net.send({ t: 'resume', token: tokenFor(net.roomId) });
+    });
+    net.on('restoreFail', (m) => {
+      const code = net.roomId;
+      const reason = m && m.reason;
+      if (reason === 'room-live') {
+        // Someone else restored it (or it was never gone) — just rejoin.
+        net.send({ t: 'resume', token: tokenFor(code) });
+        return;
+      }
+      // Unusable copy (foreign key, corrupted) — forget it so it stops being offered.
+      if (reason === 'bad-backup') dropBackup(code);
+      if (session && session.code === code) clearSession();
+      ui.setReconnecting(false);
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (isMultiplayer) { isMultiplayer = false; netEngine = null; }
+      ui.toast(reason === 'room-busy' ? 'Room ' + code + ' is in use by another game.' : 'Could not restore that game.');
+      ui.show('menu');
+      refreshUnfinished();
+    });
+    // Host only: the room's sealed state after each change (blob:null = the game
+    // finished — nothing left to restore, forget it).
+    net.on('backup', (m) => {
+      if (!m || !m.code) return;
+      if (m.blob) putBackup(m.code, m.blob, m.meta); else dropBackup(m.code);
     });
     // Another of MY devices took this seat over (account hand-off). Let go
     // cleanly: no reconnect fight — the other device owns the seat now.
@@ -623,6 +771,7 @@
       BQ.Sound.stopMusic();
       ui.toast('You rejoined this game from another device.');
       ui.show('menu');
+      refreshUnfinished();
     });
     net.on('lobby', (m) => {
       isHost = m.state.youAreHost;
@@ -642,6 +791,7 @@
       BQ.Sound.stopMusic();
       ui.toast('You were removed from the room by the host.');
       ui.show('menu');
+      refreshUnfinished();
     });
     net.on('close', () => {
       ui.setNetStatus('offline');
@@ -745,6 +895,8 @@
         if (rules.soundEnabled) BQ.Sound.startMusic();
       }
       netEngine.handle(m.snapshot, m.hint);
+      // A finished game has nothing left to restore — drop any backup of it.
+      if (m.hint && m.hint.name === 'gameOver') dropBackup(net.roomId);
     });
   }
 
@@ -977,6 +1129,7 @@
   function leaveMultiplayer() {
     if (BQ.Voice) BQ.Voice.leave();                     // hang up audio + close peers
     if (net) { net.send({ t: 'leave' }); }
+    if (session) dropBackup(session.code);              // we walked out — not ours to restore
     clearSession();                                     // don't auto-resume after leaving on purpose
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     reconnectAttempts = 0;
@@ -987,6 +1140,7 @@
     document.body.classList.remove('mp', 'spectating');
     BQ.Sound.stopMusic();
     ui.show('menu');
+    refreshUnfinished();
   }
 
   /* ---- Appearance editor (per-player; see js/prefs.js) ------------------- */
@@ -1364,7 +1518,19 @@
     // Menu
     $('#btnPlay').addEventListener('click', () => { BQ.Sound.unlock(); BQ.Sound.click(); ui.show('setup'); $('#playerName').focus(); });
     $('#btnMulti').addEventListener('click', () => { BQ.Sound.unlock(); BQ.Sound.click(); openMultiplayer(); });
-    $('#btnRejoin').addEventListener('click', () => { BQ.Sound.unlock(); BQ.Sound.click(); rejoinActiveGame(); });
+    // Unfinished games panel: rejoin / restore / forget, plus manual refresh.
+    $('#unfinishedList').addEventListener('click', (e) => {
+      const rejoin = e.target.closest('[data-rejoin]');
+      if (rejoin) { BQ.Sound.unlock(); BQ.Sound.click(); rejoinRoom(rejoin.dataset.rejoin); return; }
+      const forget = e.target.closest('[data-forget]');
+      if (forget) { BQ.Sound.click(); dropBackup(forget.dataset.forget); renderUnfinished(); }
+    });
+    $('#btnUnfinishedRefresh').addEventListener('click', () => { BQ.Sound.click(); refreshUnfinished(); });
+    // Coming back to the menu tab: the list may have changed (a game we left on
+    // the phone ended, the host restored a room…).
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && $('#menu') && $('#menu').classList.contains('active')) refreshUnfinished();
+    });
     $('#btnRules').addEventListener('click', () => { BQ.Sound.click(); $('#rulesModal').innerHTML = rulesHtml(); ui.openOverlay('rulesOverlay'); });
     $('#btnSettingsMenu').addEventListener('click', () => { BQ.Sound.click(); openMainSettings(); });
     $('#btnLookMenu').addEventListener('click', () => { BQ.Sound.click(); buildAppearanceForm(); ui.openOverlay('lookOverlay'); });
@@ -1745,9 +1911,9 @@
         const pn = $('#playerName'); if (pn) pn.value = myName;
         ui.show('menu');
         attemptResume();
-        // Seat held in a game joined from ANOTHER device? Offer a one-tap
-        // rejoin on the menu (no-op when the local token already resumed).
-        checkActiveGame();
+        // Seats held for this account elsewhere, or rooms this device can
+        // restore from a backup: list them under "Unfinished games".
+        refreshUnfinished();
       },
     });
     BQ.Account.boot();

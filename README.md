@@ -102,10 +102,15 @@ How it maps (see `party/`):
 - **`party/lobby.js`** — one shared registry that allocates unused room codes and
   answers blank-code *join* / *watch the only live game*.
 - **`partykit.json`** — serves the repo as static assets and routes `/parties/…`.
-- ⚠️ Known limit: if **every** player disconnects at once, the in-progress game
-  may not survive the 90 s reconnect window (engine state isn't persisted to
-  storage yet). A single player dropping while others stay connected reconnects
-  fine. Persisting engine state to DO storage is a follow-up.
+- **Persistence / rejoin.** The full room state is written to Durable Object
+  storage on every change and reloaded if Cloudflare evicts the object, so a
+  mid-game eviction looks like a brief reconnect. A room whose players have
+  *all* dropped is held for **24 h** (not 90 s) and stays listed on the menu
+  under **⟳ Unfinished games** for anyone whose account holds a seat — one tap
+  rejoins. As a last line of defence the **host's browser** keeps an encrypted
+  copy of the room (`backup` messages; AES-GCM, key held by the Lobby object, so
+  the host can't read hands or forge scores); if the room is ever gone from the
+  server, the host's "Restore" rebuilds it and everyone rejoins.
 
 **Alternative — Render / Railway / Fly (the legacy Node server).** The repo still
 ships `render.yaml`: push to GitHub, then on [Render](https://render.com): *New →

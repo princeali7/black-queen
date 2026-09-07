@@ -59,10 +59,16 @@
         <button class="game-tab" id="pickTreeky" data-game="treeky">🎴 Treeky</button>
         <button class="game-tab" id="pickBluff" data-game="bluff">🃏 Bluff</button>
       </div>
-      <!-- Cross-device rejoin: shown when the logged-in account holds a seat in
-           a running game (e.g. started on the phone, reopened on the desktop) -->
-      <div class="btn-row" id="rejoinRow" style="display:none">
-        <button class="btn primary" id="btnRejoin">⟳ Rejoin your game</button>
+      <!-- Unfinished games: rooms on the server that hold a seat for this
+           account (started on another device, or dropped and held), plus games
+           this device hosted and still has a sealed backup of — each rejoins /
+           restores with one tap. Hidden when there is nothing to resume. -->
+      <div class="unfinished" id="unfinishedBox" style="display:none">
+        <div class="unfinished-head">
+          <span>⟳ Unfinished games</span>
+          <button class="unfinished-refresh" id="btnUnfinishedRefresh" title="Check again">↻</button>
+        </div>
+        <div id="unfinishedList"></div>
       </div>
       <div class="btn-row">
         <button class="btn" id="btnPlay">Single Player</button>

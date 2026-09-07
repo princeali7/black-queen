@@ -26,6 +26,14 @@
  * storage on every meaningful change (see save()) and rehydrated in the
  * constructor (restore(), inside blockConcurrencyWhile) — a reconnecting
  * player's token finds their seat again and play continues where it stopped.
+ *
+ * Host backup: storage can still be lost (the room expired, a migration, an
+ * operator wiping the namespace). So the HOST's browser also holds a copy: after
+ * each burst of changes the room sends the host an AES-GCM-sealed blob of the
+ * same serialized state (`backup` message, key held by the Lobby object — the
+ * host can't read other hands or forge scores). If a later `resume` finds the
+ * room empty ("room-gone"), the host's client answers with `restore` + blob and
+ * the room rehydrates from it, then everyone rejoins as after an eviction.
  * ===========================================================================*/
 
 import { Server, getServerByName } from "partyserver";
@@ -35,12 +43,38 @@ import { getUser } from "./api.js";
 // Card-smash styles a client may request (mirrors BQ.FX.SMASHES in js/fx.js).
 const SMASH_KINDS = new Set(["punch", "fire", "bolt", "ice", "bomb"]);
 
-// Hold an all-disconnected in-progress room this long for a reconnect before the
-// alarm expires it (mirrors the old RECONNECT_GRACE_MS room cleanup).
-const RECONNECT_GRACE_MS = 90 * 1000;
+// base64 <-> bytes for the sealed host backup (chunked: a 10 KB+ blob would
+// blow the argument list of a single String.fromCharCode(...bytes) call).
+function toB64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function fromB64(str) {
+  const s = atob(str);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
+// Hold a seat whose player dropped from the LOBBY (pre-start) this long for a
+// refresh before it is freed (mirrors the old RECONNECT_GRACE_MS cleanup).
+const LOBBY_SEAT_GRACE_MS = 90 * 1000;
+// Hold an IN-PROGRESS room with nobody connected this long before the alarm
+// expires it. The room lives in storage, not memory, so holding it costs
+// nothing — and a 90s window turned every phone lock / long Wi-Fi drop on a
+// solo-human table into "room-gone" and a dead game. Players find the held room
+// again from the menu's "Unfinished games" list (lobby ?need=mine).
+const ROOM_HOLD_MS = 24 * 60 * 60 * 1000;
+// While held, wake this often to refresh the lobby registry entry (its TTL is
+// shorter than the hold) so the held room stays discoverable.
+const HOLD_REFRESH_MS = 60 * 60 * 1000;
 // Hold a dropped player's EXACT turn this long before a bot fills in, so a page
 // refresh resumes on the same turn instead of finding a bot already played.
 const DISCONNECT_TURN_GRACE_MS = 15 * 1000;
+// Coalesce host backups: many engine events fire within a second of each other
+// (cardPlayed → trickWon → turn), one encrypted blob per burst is plenty.
+const BACKUP_DEBOUNCE_MS = 1500;
 
 export class Main extends Server {
   // Keep the object in memory (and its setTimeout bot/grace timers alive) while
@@ -71,6 +105,9 @@ export class Main extends Server {
     this.bluffChallengeTimers = [];   // Bluff: pending per-bot doubt decisions
 
     this.gameDbId = null;         // D1 games.id for the current game (history)
+    this.holdUntil = null;        // in-progress room with nobody connected: expiry (ms)
+    this.backupTimer = null;      // pending host-backup send (debounced)
+    this._backupKeyP = null;      // cached AES key import (Promise) from the Lobby
 
     // connId -> { seat, name, lastChatAt, userId }
     this.clients = new Map();
@@ -100,6 +137,7 @@ export class Main extends Server {
       ready: [...this.ready],
       paused: this.paused,
       vacancy: this.vacancy,
+      holdUntil: this.holdUntil,
       seats: this.seats.map((s) => ({
         name: s.name, isBot: !!s.isBot, token: s.token || null,
         open: !!s.open, botFill: !!s.botFill,
@@ -117,16 +155,41 @@ export class Main extends Server {
   save() {
     if (!this.created) return;
     try { this.ctx.storage.put("room", this.serializeRoom()).catch(() => {}); } catch (_) {}
+    this.scheduleBackup();
   }
 
   clearSaved() {
     return this.ctx.storage.delete("room").catch(() => {});
   }
 
+  // Forget the room entirely (expired, torn down, or unrecoverable).
+  async wipe() {
+    this.clearAllTimers();
+    if (this.backupTimer) { clearTimeout(this.backupTimer); this.backupTimer = null; }
+    this.clearBluffWindow();
+    this.created = false; this.started = false; this.engine = null; this.seats = [];
+    this.paused = false; this.vacancy = null; this.holdUntil = null;
+    this.hostConnId = null; this.hostToken = null;
+    await this.clearSaved();
+  }
+
   async restore() {
     const data = await this.ctx.storage.get("room");
     if (!data || !data.created || !data.rules) return;
+    try {
+      this.hydrate(data);
+    } catch (e) {
+      // Half-restored state (created but no engine) would greet every resume
+      // with the lobby screen mid-game — better to admit the room is gone.
+      console.error("room restore failed", e);
+      await this.wipe();
+    }
+  }
 
+  // Rebuild the live room from a serialized blob (storage on wake, or the
+  // host's backup via `restore`). Every seat that was live comes back as
+  // "awaiting reconnect", exactly like an unintentional drop.
+  hydrate(data) {
     this.created = true;
     this.gameType = data.gameType || "blackqueen";
     this.rules = data.rules;
@@ -170,10 +233,100 @@ export class Main extends Server {
       this.seats.forEach((s, i) => {
         if (s.disconnected && !s.botFill) this.beginDisconnectGrace(i);
       });
-      // Nobody may come back at all — expire the room after the usual grace.
-      // (A reconnect clears this alarm in onConnect, as always.)
-      this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS).catch(() => {});
+      // Nobody may come back at all — hold the room, then expire it. A hold
+      // already in progress keeps its original deadline. (A reconnect clears
+      // the alarm in onConnect, as always.)
+      this.holdUntil = data.holdUntil || null;
+      this.armHold();
     }
+  }
+
+  // Nobody is connected to an in-progress room: keep it for ROOM_HOLD_MS, waking
+  // periodically to refresh the lobby entry so "Unfinished games" still lists it.
+  armHold() {
+    if (!this.holdUntil) this.holdUntil = Date.now() + ROOM_HOLD_MS;
+    const next = Math.min(this.holdUntil, Date.now() + HOLD_REFRESH_MS);
+    this.ctx.storage.setAlarm(next).catch(() => {});
+  }
+
+  /* ---- host backup (AES-GCM sealed copy of the room, kept in the host's
+   *      browser so a lost room can be rebuilt — see `restore`) -------------- */
+  // Key preference: a `BACKUP_SECRET` Worker secret (`wrangler secret put
+  // BACKUP_SECRET`) if configured — it survives even a wiped Durable Object
+  // namespace, which is exactly when backups matter most — otherwise the key
+  // the Lobby object minted and keeps in its own storage (zero config).
+  backupKey() {
+    if (this._backupKeyP) return this._backupKeyP;
+    this._backupKeyP = (async () => {
+      let raw;
+      if (typeof this.env.BACKUP_SECRET === "string" && this.env.BACKUP_SECRET.length >= 16) {
+        raw = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(this.env.BACKUP_SECRET));
+      } else {
+        const stub = await getServerByName(this.env.Lobby, "lobby");
+        raw = fromB64(await stub.getBackupKey());
+      }
+      return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+    })().catch((e) => {
+      // Try again on the next backup rather than caching the failure forever.
+      this._backupKeyP = null;
+      console.warn("backup key unavailable", e);
+      return null;
+    });
+    return this._backupKeyP;
+  }
+
+  async sealBackup() {
+    const key = await this.backupKey();
+    if (!key) return null;
+    const data = this.serializeRoom();
+    data.code = this.name;            // a blob only ever restores ITS OWN room
+    data.savedAt = Date.now();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(data)));
+    const out = new Uint8Array(iv.length + ct.byteLength);
+    out.set(iv, 0); out.set(new Uint8Array(ct), iv.length);
+    return toB64(out);
+  }
+
+  async openBackup(blob) {
+    if (typeof blob !== "string" || blob.length < 24 || blob.length > 2 * 1024 * 1024) return null;
+    const key = await this.backupKey();
+    if (!key) return null;
+    try {
+      const buf = fromB64(blob);
+      const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, key, buf.slice(12));
+      return JSON.parse(new TextDecoder().decode(pt));
+    } catch (_) { return null; }     // tampered, foreign key, or garbage
+  }
+
+  scheduleBackup() {
+    if (!this.started || this.backupTimer) return;
+    this.backupTimer = setTimeout(() => {
+      this.backupTimer = null;
+      this.sendBackup().catch(() => {});
+    }, BACKUP_DEBOUNCE_MS);
+  }
+
+  // Ship the current sealed state to whoever is host right now. A finished game
+  // tells the host to drop its copy instead — there is nothing left to restore.
+  async sendBackup() {
+    const host = this.connOf(this.hostConnId);
+    if (!host || !this.started || !this.engine) return;
+    if (this.engine.phase === "gameOver") { this.send(host, { t: "backup", code: this.name, blob: null }); return; }
+    const blob = await this.sealBackup();
+    if (!blob) return;
+    // Re-check: the host may have changed or left while we were encrypting.
+    const now = this.connOf(this.hostConnId);
+    if (!now || !this.started) return;
+    this.send(now, {
+      t: "backup", code: this.name, blob,
+      meta: {
+        gameType: this.gameType,
+        round: (this.gameType === "blackqueen" && this.engine) ? this.engine.round : null,
+        players: this.seats.map((s) => s.name),
+        ts: Date.now(),
+      },
+    });
   }
 
   // Restart whatever the engine is waiting on when a player attaches to a
@@ -188,7 +341,10 @@ export class Main extends Server {
     } else if (this.gameType === "bluff" && e.phase === "awaitChallenge") {
       this.scheduleBluffWindow();
     } else if (this.gameType === "blackqueen" && e.phase === "awaitReshuffle" &&
-               this.seatIsBot(e.reshuffleSeat)) {
+               this.seatIsBot(e.reshuffleSeat) && !this.seatAwaitingReconnect(e.reshuffleSeat)) {
+      // The trailing player is a bot (or gone for good) — deal without asking.
+      // A player still inside their reconnect grace keeps the offer; the grace
+      // timer deals if they never return (see beginDisconnectGrace).
       e.beginPlay();
     }
   }
@@ -213,6 +369,7 @@ export class Main extends Server {
         body: JSON.stringify({
           code: this.name,
           removed: !!removed,
+          gameType: this.gameType,
           started: this.started,
           joinable: this.isJoinable(),
           live: this.started && !!this.engine,
@@ -294,6 +451,8 @@ export class Main extends Server {
     // create/join/resume; until then this is an anonymous menu connection.
     const meta = { seat: -1, name: "Player", lastChatAt: 0, userId: null };
     this.clients.set(conn.id, meta);
+    // Someone is here: stop the hold/expiry clock (re-armed when they all leave).
+    this.holdUntil = null;
     this.ctx.storage.deleteAlarm().catch(() => {});
 
     // Resolve the logged-in user from the session cookie in the background (so a
@@ -429,6 +588,11 @@ export class Main extends Server {
         if (!this.paused && this.engine && this.engine.phase === "awaitHuman" &&
             this.engine.currentPlayerIndex === seatIdx) {
           this.scheduleBot(seatIdx);
+        }
+        // They were being offered a re-deal — the table shouldn't wait forever.
+        if (!this.paused && this.engine && this.gameType === "blackqueen" &&
+            this.engine.phase === "awaitReshuffle" && this.engine.reshuffleSeat === seatIdx) {
+          this.engine.beginPlay();
         }
       }
     }, DISCONNECT_TURN_GRACE_MS);
@@ -594,7 +758,12 @@ export class Main extends Server {
           seat.userId = meta.userId;
           if (this.engine && this.engine.players[openSeat]) this.engine.players[openSeat].name = meta.name;
           meta.seat = openSeat;
-          this.send(conn, { t: "joined", code: this.name, seat: openSeat, token, host: false });
+          // A restored room may have no host connected yet — someone must be
+          // able to resolve vacancies / restart, so the newcomer takes it until
+          // the real host's token reclaims it.
+          const becomesHost = !this.connOf(this.hostConnId);
+          if (becomesHost) this.hostConnId = conn.id;
+          this.send(conn, { t: "joined", code: this.name, seat: openSeat, token, host: becomesHost });
           this.send(conn, { t: "game", snapshot: this.seatSnap(openSeat), hint: { name: "resync" } });
           this.resumePlay();
           break;
@@ -680,7 +849,10 @@ export class Main extends Server {
         seat.userId = meta.userId;
         meta.seat = seatIdx;
         meta.name = seat.name;
-        const isHost = !!(this.hostToken && this.hostToken === seat.token);
+        // The host's token reclaims host. Otherwise, if no host is connected
+        // (a restored room until its host returns), this player stands in —
+        // a table must always have someone who can add a bot or play again.
+        const isHost = !!(this.hostToken && this.hostToken === seat.token) || !this.connOf(this.hostConnId);
         if (isHost) this.hostConnId = conn.id;
 
         this.send(conn, { t: "joined", code: this.name, seat: seatIdx, token: seat.token, host: isHost });
@@ -708,6 +880,34 @@ export class Main extends Server {
           this.broadcastPresence({ kind: "back", name: seat.name });
         }
         this.reportLobby();
+        break;
+      }
+      // The host's client found this room empty ("room-gone") and offers its
+      // sealed backup. Only a blob we sealed for THIS room opens, and only a
+      // player who held a seat in it (token or account) may bring it back.
+      case "restore": {
+        if (this.created) {
+          this.send(conn, { t: "restoreFail", reason: this.started ? "room-live" : "room-busy" });
+          break;
+        }
+        const data = await this.openBackup(msg.blob);
+        const ok = data && data.code === this.name && data.created && data.rules && data.started && data.engine &&
+          Array.isArray(data.seats) && data.seats.some((s) =>
+            (msg.token && s.token && s.token === msg.token) ||
+            (meta.userId != null && s.userId != null && s.userId === meta.userId));
+        if (!ok) { this.send(conn, { t: "restoreFail", reason: "bad-backup" }); break; }
+        try {
+          this.hydrate(data);
+        } catch (e) {
+          console.error("room restore from backup failed", e);
+          await this.wipe();
+          this.send(conn, { t: "restoreFail", reason: "bad-backup" });
+          break;
+        }
+        this.save();
+        await this.reportLobby();
+        // The client follows up with a normal `resume` to take its seat.
+        this.send(conn, { t: "restored", code: this.name });
         break;
       }
       case "rules": {
@@ -1381,13 +1581,12 @@ export class Main extends Server {
     const meta = this.clients.get(conn.id);
     this.clients.delete(conn.id);
 
-    // Spectators hold no seat — just drop them from the watch list.
-    if (this.spectators.has(conn.id)) {
-      this.spectators.delete(conn.id);
-      return;
-    }
+    // Spectators hold no seat — drop them from the watch list, then fall through
+    // to the "anyone still here?" check below: a spectator's connect cleared the
+    // hold alarm (onConnect), so their leaving must be able to re-arm it.
+    const wasSpectator = this.spectators.delete(conn.id);
 
-    const seatIdx = meta ? meta.seat : -1;
+    const seatIdx = (meta && !wasSpectator) ? meta.seat : -1;
     const seat = this.seats[seatIdx];
     if (seat && seat.connId === conn.id) {
       if (intentional) {
@@ -1433,14 +1632,16 @@ export class Main extends Server {
             if (this.seats.some((s) => s.connId)) this.broadcastLobby();
             this.reportLobby();
           }
-        }, RECONNECT_GRACE_MS);
+        }, LOBBY_SEAT_GRACE_MS);
         this.broadcastLobby();
       }
     }
 
-    // Trailing player who was deciding a re-deal just dropped — play on.
+    // Trailing player who was deciding a re-deal just left for good — play on.
+    // (An unintentional drop keeps the offer through its reconnect grace; the
+    // grace timer deals if they never return.)
     if (this.engine && this.engine.phase === "awaitReshuffle" &&
-        this.seatIsBot(this.engine.reshuffleSeat)) {
+        this.seatIsBot(this.engine.reshuffleSeat) && !this.seatAwaitingReconnect(this.engine.reshuffleSeat)) {
       this.engine.beginPlay();
     }
 
@@ -1454,16 +1655,16 @@ export class Main extends Server {
     if (!anyHuman) {
       if (this.paused) { this.paused = false; this.vacancy = null; }
       if (!this.started) {
-        this.clearAllTimers();
-        this.created = false; this.seats = []; this.engine = null;
-        await this.clearSaved();
+        await this.wipe();
         // Awaited: the object may evict right after this handler returns, so the
         // "room gone" report must land before then (otherwise the lobby keeps a
         // stale joinable entry pointing at a dead room until its TTL sweep).
         await this.reportLobby(true);
       } else {
-        // Hold the in-progress game for a reconnect, then expire via alarm.
-        this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS).catch(() => {});
+        // Hold the in-progress game for a rejoin (hours, not seconds — it is
+        // persisted), then expire via alarm.
+        this.holdUntil = null;
+        this.armHold();
       }
     } else if (this.paused && this.vacancy) {
       this.broadcastPaused(true, this.vacancy.name);
@@ -1482,15 +1683,19 @@ export class Main extends Server {
     });
   }
 
-  // Fired RECONNECT_GRACE_MS after the last socket closed on an in-progress game.
-  // Nobody came back — let the room go (its in-memory state is discarded when the
-  // object evicts; we just clear timers and tell the lobby).
+  // Fires while an in-progress room sits with nobody connected: every
+  // HOLD_REFRESH_MS to keep the lobby entry alive (so the menu's "Unfinished
+  // games" can still find it), and finally at holdUntil — nobody came back, let
+  // the room go and tell the lobby.
   async onAlarm() {
     const anyHuman = this.seats.some((s) => s.connId && this.connOf(s.connId));
     if (anyHuman) return;
-    this.clearAllTimers();
-    this.created = false; this.started = false; this.engine = null; this.seats = [];
-    await this.clearSaved();
+    if (this.started && this.holdUntil && Date.now() < this.holdUntil - 1000) {
+      await this.reportLobby();
+      this.armHold();
+      return;
+    }
+    await this.wipe();
     await this.reportLobby(true);
   }
 }
