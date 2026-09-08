@@ -105,12 +105,13 @@ How it maps (see `party/`):
 - **Persistence / rejoin.** The full room state is written to Durable Object
   storage on every change and reloaded if Cloudflare evicts the object, so a
   mid-game eviction looks like a brief reconnect. A room whose players have
-  *all* dropped is held for **24 h** (not 90 s) and stays listed on the menu
+  *all* dropped is held for **7 days** (not 90 s) and stays listed on the menu
   under **⟳ Unfinished games** for anyone whose account holds a seat — one tap
-  rejoins. As a last line of defence the **host's browser** keeps an encrypted
-  copy of the room (`backup` messages; AES-GCM, key held by the Lobby object, so
-  the host can't read hands or forge scores); if the room is ever gone from the
-  server, the host's "Restore" rebuilds it and everyone rejoins.
+  rejoins. As a last line of defence **every seated player's browser** keeps an
+  encrypted copy of the room (`backup` messages; gzip + AES-GCM, key from the
+  `BACKUP_SECRET` Worker secret or one the Lobby object mints, so nobody can
+  read hands or forge scores; kept 30 days); if the room is ever gone from the
+  server, any player's "Restore" rebuilds it and everyone rejoins.
 
 **Alternative — Render / Railway / Fly (the legacy Node server).** The repo still
 ships `render.yaml`: push to GitHub, then on [Render](https://render.com): *New →

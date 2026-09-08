@@ -27,13 +27,14 @@
  * constructor (restore(), inside blockConcurrencyWhile) — a reconnecting
  * player's token finds their seat again and play continues where it stopped.
  *
- * Host backup: storage can still be lost (the room expired, a migration, an
- * operator wiping the namespace). So the HOST's browser also holds a copy: after
- * each burst of changes the room sends the host an AES-GCM-sealed blob of the
- * same serialized state (`backup` message, key held by the Lobby object — the
- * host can't read other hands or forge scores). If a later `resume` finds the
- * room empty ("room-gone"), the host's client answers with `restore` + blob and
- * the room rehydrates from it, then everyone rejoins as after an eviction.
+ * Player backups: storage can still be lost (the room expired, a migration, an
+ * operator wiping the namespace). So every seated player's browser also holds a
+ * copy: after each burst of changes the room sends them a gzip+AES-GCM-sealed
+ * blob of the same serialized state (`backup` message; key = BACKUP_SECRET or a
+ * key the Lobby object keeps — nobody can read other hands or forge scores). If
+ * a later `resume` finds the room empty ("room-gone"), that client answers with
+ * `restore` + blob and the room rehydrates from it, then everyone rejoins as
+ * after an eviction.
  * ===========================================================================*/
 
 import { Server, getServerByName } from "partyserver";
@@ -56,6 +57,15 @@ function fromB64(str) {
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;
 }
+// gzip / gunzip via the platform streams (Workers and browsers both ship them).
+async function gzip(bytes) {
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
+  return new Uint8Array(buf);
+}
+async function gunzip(bytes) {
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+  return new Uint8Array(buf);
+}
 
 // Hold a seat whose player dropped from the LOBBY (pre-start) this long for a
 // refresh before it is freed (mirrors the old RECONNECT_GRACE_MS cleanup).
@@ -65,16 +75,16 @@ const LOBBY_SEAT_GRACE_MS = 90 * 1000;
 // nothing — and a 90s window turned every phone lock / long Wi-Fi drop on a
 // solo-human table into "room-gone" and a dead game. Players find the held room
 // again from the menu's "Unfinished games" list (lobby ?need=mine).
-const ROOM_HOLD_MS = 24 * 60 * 60 * 1000;
+const ROOM_HOLD_MS = 7 * 24 * 60 * 60 * 1000;
 // While held, wake this often to refresh the lobby registry entry (its TTL is
 // shorter than the hold) so the held room stays discoverable.
 const HOLD_REFRESH_MS = 60 * 60 * 1000;
 // Hold a dropped player's EXACT turn this long before a bot fills in, so a page
 // refresh resumes on the same turn instead of finding a bot already played.
 const DISCONNECT_TURN_GRACE_MS = 15 * 1000;
-// Coalesce host backups: many engine events fire within a second of each other
-// (cardPlayed → trickWon → turn), one encrypted blob per burst is plenty.
-const BACKUP_DEBOUNCE_MS = 1500;
+// Coalesce player backups: many engine events fire within a second of each
+// other (cardPlayed → trickWon → turn); one sealed blob per burst is plenty.
+const BACKUP_DEBOUNCE_MS = 3000;
 
 export class Main extends Server {
   // Keep the object in memory (and its setTimeout bot/grace timers alive) while
@@ -244,13 +254,17 @@ export class Main extends Server {
   // Nobody is connected to an in-progress room: keep it for ROOM_HOLD_MS, waking
   // periodically to refresh the lobby entry so "Unfinished games" still lists it.
   armHold() {
-    if (!this.holdUntil) this.holdUntil = Date.now() + ROOM_HOLD_MS;
+    if (!this.holdUntil) {
+      this.holdUntil = Date.now() + ROOM_HOLD_MS;
+      this.save();                       // the deadline must survive an eviction
+    }
     const next = Math.min(this.holdUntil, Date.now() + HOLD_REFRESH_MS);
     this.ctx.storage.setAlarm(next).catch(() => {});
   }
 
-  /* ---- host backup (AES-GCM sealed copy of the room, kept in the host's
-   *      browser so a lost room can be rebuilt — see `restore`) -------------- */
+  /* ---- player backups (gzip + AES-GCM sealed copy of the room, kept in every
+   *      seated player's browser so a lost room can be rebuilt by whoever is
+   *      still around — see `restore`) ---------------------------------------- */
   // Key preference: a `BACKUP_SECRET` Worker secret (`wrangler secret put
   // BACKUP_SECRET`) if configured — it survives even a wiped Durable Object
   // namespace, which is exactly when backups matter most — otherwise the key
@@ -281,8 +295,11 @@ export class Main extends Server {
     const data = this.serializeRoom();
     data.code = this.name;            // a blob only ever restores ITS OWN room
     data.savedAt = Date.now();
+    // gzip first: the JSON shrinks ~4-5x, so shipping it to every player each
+    // burst stays cheap even on mobile data.
+    const plain = await gzip(new TextEncoder().encode(JSON.stringify(data)));
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(data)));
+    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain);
     const out = new Uint8Array(iv.length + ct.byteLength);
     out.set(iv, 0); out.set(new Uint8Array(ct), iv.length);
     return toB64(out);
@@ -295,7 +312,7 @@ export class Main extends Server {
     try {
       const buf = fromB64(blob);
       const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, key, buf.slice(12));
-      return JSON.parse(new TextDecoder().decode(pt));
+      return JSON.parse(new TextDecoder().decode(await gunzip(new Uint8Array(pt))));
     } catch (_) { return null; }     // tampered, foreign key, or garbage
   }
 
@@ -307,18 +324,24 @@ export class Main extends Server {
     }, BACKUP_DEBOUNCE_MS);
   }
 
-  // Ship the current sealed state to whoever is host right now. A finished game
-  // tells the host to drop its copy instead — there is nothing left to restore.
+  // Ship the current sealed state to every seated, connected player — any one
+  // of them can bring the room back, so losing the host's phone loses nothing.
+  // A finished game tells them to drop their copies instead.
+  seatedConns() {
+    const out = [];
+    this.seats.forEach((s) => { if (!s.connId) return; const c = this.connOf(s.connId); if (c) out.push(c); });
+    return out;
+  }
   async sendBackup() {
-    const host = this.connOf(this.hostConnId);
-    if (!host || !this.started || !this.engine) return;
-    if (this.engine.phase === "gameOver") { this.send(host, { t: "backup", code: this.name, blob: null }); return; }
+    if (!this.started || !this.engine || !this.seatedConns().length) return;
+    if (this.engine.phase === "gameOver") {
+      const clear = { t: "backup", code: this.name, blob: null };
+      this.seatedConns().forEach((c) => this.send(c, clear));
+      return;
+    }
     const blob = await this.sealBackup();
-    if (!blob) return;
-    // Re-check: the host may have changed or left while we were encrypting.
-    const now = this.connOf(this.hostConnId);
-    if (!now || !this.started) return;
-    this.send(now, {
+    if (!blob || !this.started) return;
+    const payload = {
       t: "backup", code: this.name, blob,
       meta: {
         gameType: this.gameType,
@@ -326,7 +349,9 @@ export class Main extends Server {
         players: this.seats.map((s) => s.name),
         ts: Date.now(),
       },
-    });
+    };
+    // Re-read the connections: seats may have changed while we were sealing.
+    this.seatedConns().forEach((c) => this.send(c, payload));
   }
 
   // Restart whatever the engine is waiting on when a player attaches to a
@@ -882,7 +907,7 @@ export class Main extends Server {
         this.reportLobby();
         break;
       }
-      // The host's client found this room empty ("room-gone") and offers its
+      // A player's client found this room empty ("room-gone") and offers its
       // sealed backup. Only a blob we sealed for THIS room opens, and only a
       // player who held a seat in it (token or account) may bring it back.
       case "restore": {
@@ -1690,7 +1715,10 @@ export class Main extends Server {
   async onAlarm() {
     const anyHuman = this.seats.some((s) => s.connId && this.connOf(s.connId));
     if (anyHuman) return;
-    if (this.started && this.holdUntil && Date.now() < this.holdUntil - 1000) {
+    if (this.started && (!this.holdUntil || Date.now() < this.holdUntil - 1000)) {
+      // Still inside the hold — or a stray alarm caught an in-progress room
+      // with no deadline at all (never wipe a live game on a technicality:
+      // start a fresh hold instead).
       await this.reportLobby();
       this.armHold();
       return;

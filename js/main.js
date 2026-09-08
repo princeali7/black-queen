@@ -53,14 +53,15 @@
     try { localStorage.removeItem('bq_session'); } catch (_) {}
   }
 
-  // ---- host backups of multiplayer rooms -----------------------------------
-  // While we are host, the room streams us a sealed (AES-GCM, server-keyed)
-  // copy of its full state after every change. We can't read it — it's only
-  // useful handed back: if the room ever vanishes from the server, `restore`
-  // rebuilds it from this blob and everyone rejoins. code -> {blob, meta, ts}.
+  // ---- backups of multiplayer rooms we're seated in --------------------------
+  // The room streams every seated player a sealed (gzip + AES-GCM, server-
+  // keyed) copy of its full state after every change. We can't read it — it's
+  // only useful handed back: if the room ever vanishes from the server,
+  // `restore` rebuilds it from this blob and everyone rejoins. Any one player's
+  // copy is enough. code -> {blob, meta, ts}.
   const BACKUPS_KEY = 'bq_backups';
-  const BACKUP_MAX = 6;
-  const BACKUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const BACKUP_MAX = 10;
+  const BACKUP_TTL_MS = 30 * 24 * 60 * 60 * 1000;
   function loadBackups() {
     let all;
     try { all = JSON.parse(localStorage.getItem(BACKUPS_KEY) || '{}'); } catch (_) { all = {}; }
@@ -567,7 +568,7 @@
    *   • the lobby's answer to "which rooms hold a seat for MY account?"
    *     (GET ?need=mine — a game started on another device, or one the server
    *     is holding because everyone dropped);
-   *   • this device's host backups (see putBackup) — a room the server LOST
+   *   • this device's sealed backups (see putBackup) — a room the server LOST
    *     can be rebuilt from these, so they're listed even when the lobby has
    *     never heard of the room.
    * One tap rejoins: connect, `resume` (token if we have one, else by account);
@@ -678,7 +679,12 @@
       ui.setReconnecting(true);
       connectTo(session.code)
         .then(() => net.send({ t: 'resume', code: session.code, token: session.token }))
-        .catch(() => { ui.setReconnecting(false); resumeSingleGame(); });
+        .catch(() => {
+          // Server unreachable right now (offline, deploy in flight). Keep the
+          // session and keep trying — a game is only over when the server says so.
+          ui.setReconnecting(false);
+          if (!resumeSingleGame()) { ui.setReconnecting(true); scheduleReconnect(); }
+        });
       return;
     }
     // Otherwise restore a single-player game in progress (works offline too).
@@ -752,8 +758,8 @@
       ui.show('menu');
       refreshUnfinished();
     });
-    // Host only: the room's sealed state after each change (blob:null = the game
-    // finished — nothing left to restore, forget it).
+    // The room's sealed state after each change, sent to every seated player
+    // (blob:null = the game finished — nothing left to restore, forget it).
     net.on('backup', (m) => {
       if (!m || !m.code) return;
       if (m.blob) putBackup(m.code, m.blob, m.meta); else dropBackup(m.code);
